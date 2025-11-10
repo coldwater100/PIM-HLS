@@ -1,105 +1,130 @@
-/**
- * @module generic_adder_tree
- * @brief 'INPUT_COUNT'에 따라 자동으로 파이프라인 단을 생성하는
- * 파라미터화된 Adder Tree (SystemVerilog 필요)
- *
- * @param INPUT_COUNT - 입력 개수 (반드시 2의 거듭제곱: 4, 8, 16, ...)
- * @param DATA_WIDTH  - 각 입력의 비트 폭
- */
- 
-module generic_adder_tree #(
+`timescale 1ns / 1ps
 
-    // 입력 데이터 개수
-    parameter INPUT_COUNT = 8,
-    
-    // 각 입력 데이터의 비트 폭
-    parameter DATA_WIDTH  = 16
-    
-) (
-    input clk,
-    input rst_n,
-
-    // 2D 배열 입력 포트
-    input [INPUT_COUNT-1:0] [DATA_WIDTH-1:0] i_data,
-
-    // 최종 출력
-    output reg [$clog2(INPUT_COUNT)+DATA_WIDTH-1:0] o_sum
+module sub_array #(
+    parameter XBAR_R   = 3,    // Row 수
+    parameter XBAR_C   = 3,    // Column 수
+    parameter W_BITS   = 8,    // Weight bit width
+    parameter I_BITS   = 8,    // Input bit width
+    parameter ACC_BITS = 32    // 누산기 bit width
+)(
+    input  wire clk,
+    input  wire reset,
+    input  wire mem_en,
+    input  wire read_en,
+    input  wire calc_en,
+    input  wire [31:0] row_address,          // Row address
+    input  wire [31:0] col_address,          // Column address
+    input  wire [W_BITS-1:0] mem_write_in,   // Weight write data
+    input  wire [I_BITS*XBAR_R-1:0] in_feat_flat, // Flattened input vector
+    output reg  [W_BITS-1:0] mem_read_out,   // Weight read data
+    output wire [ACC_BITS*XBAR_C-1:0] out_feat_flat, // Flattened output (auto width)
+    output reg  available                    // Done flag
 );
 
-    // 1. 파라미터 자동 계산
-    
-    // 트리 단계 수 (예: 8입력 -> $clog2(8) = 3단계)
-    localparam STAGES = $clog2(INPUT_COUNT); 
-    
-    // 최종 출력 비트 폭 (예: 16bit + 3 = 19bit)
-    localparam FINAL_WIDTH = DATA_WIDTH + STAGES;
+    // ===============================
+    // 내부 메모리 및 레지스터 선언
+    // ===============================
+    reg [W_BITS-1:0] mem [0:XBAR_R-1][0:XBAR_C-1];    // 가중치 메모리
+    reg [I_BITS-1:0] in_data [0:XBAR_R-1];            // 입력 데이터
+    reg [ACC_BITS-1:0] acc [0:XBAR_C-1];              // 누산기
 
-    // 2. 파이프라인 중간 단계 변수
-    
-    // Stage 0 (입력단)은 조합 논리(wire)로 선언
-    wire [FINAL_WIDTH-1:0] sums_stage_0 [0:INPUT_COUNT-1];
+    integer r, c;
 
-    // Stage 1 ~ Stage (STAGES-1)은 순차 논리(reg)로 선언
-    // (8입력(STAGES=3)의 경우, sums_pipe_reg[1]과 sums[2]가 생성됨)
-    // (STAGES=1, 즉 2입력인 경우 이 배열은 생성되지 않음)
-    reg [FINAL_WIDTH-1:0] sums_pipe_reg [1:STAGES-1][0:INPUT_COUNT-1];
+    // 입력 언팩 (in_feat_flat → in_data)
+    always @(*) begin
+        for (r = 0; r < XBAR_R; r = r + 1)
+            in_data[r] = in_feat_flat[I_BITS*(r+1)-1 -: I_BITS];
+    end
 
-    // 3. 하드웨어 생성
-    genvar s, i; // generate 루프용 변수
+    // ===============================
+    // 메모리 쓰기
+    // ===============================
+    always @(posedge clk) begin
+        if (mem_en && !read_en && !calc_en)
+            mem[row_address][col_address] <= mem_write_in;
+    end
+
+    // ===============================
+    // 메모리 읽기
+    // ===============================
+    always @(posedge clk) begin
+        if (read_en && !mem_en && !calc_en)
+            mem_read_out <= mem[row_address][col_address];
+    end
+
+
+    // ========================================================
+    // 병렬 Cross-bit AND + Shift → Adder Tree 기반 합산
+    // ========================================================
+    // Partial product 개수 = I_BITS * W_BITS
+    localparam PP_COUNT = I_BITS * W_BITS;
+    localparam PADDED_PP_COUNT = (1 << $clog2(PP_COUNT));  // 2의 거듭제곱 보정
+
+    // 각 column별 partial product와 adder tree 출력
+    wire [ACC_BITS-1:0] pp_data     [0:XBAR_C-1][0:PADDED_PP_COUNT-1];
+    wire [ACC_BITS-1:0] adder_sum   [0:XBAR_C-1];
+
+    genvar gc, gi, gj, gr;
 
     generate
-        // 0단계: 입력 연결 (조합 논리)
-        // always_comb -> generate for + assign
-        for (i = 0; i < INPUT_COUNT; i = i + 1) begin : INPUT_PADDING
-            // (FINAL_WIDTH - DATA_WIDTH) 만큼 0으로 채워 비트 폭 맞춤
-            assign sums_stage_0[i] = {{(FINAL_WIDTH-DATA_WIDTH){1'b0}}, i_data[i]};
+        for (gc = 0; gc < XBAR_C; gc = gc + 1) begin : COL_BLOCK
+
+            // 1️⃣ Partial Product 생성
+            for (gr = 0; gr < XBAR_R; gr = gr + 1) begin : ROW_BLOCK
+                for (gi = 0; gi < I_BITS; gi = gi + 1) begin : IN_BIT
+                    for (gj = 0; gj < W_BITS; gj = gj + 1) begin : W_BIT
+                        localparam IDX = gi*W_BITS + gj;
+                        assign pp_data[gc][IDX] =
+                            ((in_data[gr][gi] & mem[gr][gc][gj]) << (gi + gj));
+                    end
+                end
+            end
+
+            // 나머지 인덱스는 0으로 패딩 (adder tree 입력 수 맞춤)
+            for (gi = PP_COUNT; gi < PADDED_PP_COUNT; gi = gi + 1) begin : PAD
+                assign pp_data[gc][gi] = 0;
+            end
+
+            // 2️⃣ Adder Tree 인스턴스
+            generic_adder_tree #(
+                .INPUT_COUNT(PADDED_PP_COUNT),
+                .DATA_WIDTH(ACC_BITS)
+            ) u_adder_tree (
+                .clk(clk),
+                .rst_n(~reset),
+                .i_data(pp_data[gc]),
+                .o_sum(adder_sum[gc])
+            );
+
         end
+    endgenerate
 
-        // 파이프라인 1단계 ~ 마지막(STAGES) 단계 생성
-        for (s = 0; s < STAGES; s = s + 1) begin : STAGE_LOOP
-            
-            // 현재 단계(s)에서 필요한 덧셈기(Adder)의 수
-            localparam NUM_ADDERS = INPUT_COUNT / (2**(s+1));
 
-            for (i = 0; i < NUM_ADDERS; i = i + 1) begin : ADDER_LOOP
-                
-                // 현 단계 덧셈기의 입력을 명확히 선택
-                wire [FINAL_WIDTH-1:0] in_a, in_b;
-                
-                // s=0 (첫 단계)이면 입력(sums_stage_0)에서 가져옴
-                // s>0 (중간 단계)이면 이전 파이프라인 레지스터(sums_pipe_reg[s])에서 가져옴
-                assign in_a = (s == 0) ? sums_stage_0[2*i]   : sums_pipe_reg[s][2*i];
-                assign in_b = (s == 0) ? sums_stage_0[2*i+1] : sums_pipe_reg[s][2*i+1];
-                
-                
-                // 마지막 단계(s == STAGES-1)인 경우
-                // 출력을 'o_sum' 레지스터에 바로 저장
-                if (s == STAGES - 1) begin : FINAL_STAGE_REG
-                    
-                    always @(posedge clk or negedge rst_n) begin
-                        if (!rst_n) begin
-                            o_sum <= 0;
-                        end else begin
-                            // 덧셈 결과를 최종 출력 레지스터에 저장
-                            o_sum <= in_a + in_b;
-                        end
-                    end
-                    
-                // 중간 단계인 경우
-                // 출력을 다음 단계 'sums_pipe_reg' 배열에 저장
-                end else begin : INTERMEDIATE_STAGE_REG
-                
-                    always @(posedge clk or negedge rst_n) begin
-                        if (!rst_n) begin
-                            sums_pipe_reg[s+1][i] <= 0;
-                        end else begin
-                            // 덧셈 결과를 다음 파이프라인 레지스터에 저장
-                            sums_pipe_reg[s+1][i] <= in_a + in_b;
-                        end
-                    end
-                end // if-else
-            end // ADDER_LOOP
-        end // STAGE_LOOP
+    // ========================================================
+    // 3️⃣ 출력 누산기 및 상태 플래그
+    // ========================================================
+    always @(posedge clk) begin
+        if (reset) begin
+            available <= 0;
+            for (c = 0; c < XBAR_C; c = c + 1)
+                acc[c] <= 0;
+        end
+        else if (calc_en) begin
+            for (c = 0; c < XBAR_C; c = c + 1)
+                acc[c] <= adder_sum[c];  // adder tree 결과 저장
+            available <= 1;
+        end
+    end
+
+
+    // ========================================================
+    // 4️⃣ 출력 벡터 패킹 (acc → out_feat_flat)
+    // ========================================================
+    genvar gc_pack;
+    generate
+        for (gc_pack = 0; gc_pack < XBAR_C; gc_pack = gc_pack + 1) begin : PACK_OUT
+            assign out_feat_flat[ACC_BITS*(gc_pack+1)-1 -: ACC_BITS] = acc[gc_pack];
+        end
     endgenerate
 
 endmodule
